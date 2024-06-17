@@ -1,0 +1,262 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TSL2561_U.h>
+#include <Adafruit_BME280.h>
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+
+#define PressaoaNivelDoMar_HPA (1013.25)
+   
+Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+Adafruit_BME280 bme;
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+
+IPAddress ardIP(192, 168, 66, 170);
+IPAddress serverIP(192, 168, 66, 160);
+int serverPort = 5290; //5290
+char path[] = "/";
+
+EthernetClient client;
+
+int InterruptCounter;
+
+void countup() {
+  InterruptCounter++;
+}
+
+class Anemometro {
+  private:
+    const int RecordTime = 3;
+    const int SensorPin = 3;
+
+    void meassure() {
+      InterruptCounter = 0;
+      attachInterrupt(digitalPinToInterrupt(SensorPin), countup, RISING);
+      delay(1000 * RecordTime);
+      detachInterrupt(digitalPinToInterrupt(SensorPin));
+      WindSpeed = (float)InterruptCounter / (float)RecordTime * 2.4;
+    }
+
+  public:
+    float WindSpeed;
+
+    float getData() {
+      meassure();
+    }
+};
+
+class Pluviometro {
+  private:
+    const float mmPerPulse = 0.173;
+    int sensor = 0;
+    int statusBefore = 0;
+
+    void getMm() {
+      for (int n = 0; n <= 30; n++) {
+        sensor = digitalRead(9);
+  
+        if (sensor != statusBefore) {
+          mmTotal = mmTotal + mmPerPulse;
+        }
+        delay(100);
+        statusBefore = sensor;
+      }
+    }
+
+  public:
+    float mmTotal = 0;
+
+    void start() {
+      pinMode(9, INPUT);
+    }
+
+    void getData() {
+      getMm();
+    }
+};
+
+class Tsl2561 {
+  public:
+    float visible;
+    float inf;
+
+    void start() {
+      if (!tsl.begin()) {
+        Serial.println("ERROR: No TSL2561");
+        exit(0);
+      }
+      configureSensor();
+    }
+
+    void getLux() {
+      uint16_t broadband;
+      uint16_t ir;
+
+      tsl.getLuminosity(&broadband, &ir);
+      inf = ir;
+      visible = tsl.calculateLux(broadband, ir);
+    }
+
+  private:
+    void configureSensor(void) {
+      tsl.enableAutoRange(true);
+      tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_402MS);
+    }
+};
+
+class Bme280 {
+  public:
+    float temp;
+    float umid;
+    float pres;
+
+    void start() {
+      bme.begin(0x76);
+    }
+
+    void getData() {
+      temp = bme.readTemperature();
+      umid = bme.readHumidity();
+      pres = bme.readPressure() / 100.0F;
+    }
+};
+
+class Ml8511 {
+  public:
+    float uvInt;
+    void getUV() {
+      int uv_Level = analogRead_average(UV_OUT);
+      int ref_Level = analogRead_average(REF_3V3);
+
+      float output_Voltage = 3.3 / ref_Level * uv_Level;
+      float uvIntensity = mapfloat(output_Voltage, 0.99, 2.8, 0.0, 15.0);
+
+      uvInt = uvIntensity;
+    }
+  private:
+    int UV_OUT = A0;
+    int REF_3V3 = A1;
+
+    int analogRead_average(int pinToRead) {
+      int NumberOfSamples = 8;
+      int runningValue = 0; 
+
+      for(int x = 0; x < NumberOfSamples; x++)
+        runningValue += analogRead(pinToRead);
+      runningValue /= NumberOfSamples;
+
+      return(runningValue);
+    }
+
+    float mapfloat(float x, float in_min, float in_max, float out_min, float out_max) {
+      return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+    }
+};
+
+class W5100 {
+  public:
+    void start() {
+      Ethernet.begin(mac, ardIP);
+      macAddress = getMacAddress();
+    }
+
+    void send(float temperatura, float pressao, float umidade, float luzUV, float luzNormal, float luzInfravermelha, float velocidadeVento, float nivelPrecipitacao) {
+      post(temperatura, pressao, umidade, luzUV, luzNormal, luzInfravermelha, velocidadeVento, nivelPrecipitacao);
+    }
+  private:
+    String macAddress;
+
+    String getMacAddress() {
+      byte mac[6];
+      String macAddr = "";
+      
+      Ethernet.MACAddress(mac);
+      for (int i = 0; i < 6; ++i) {
+          if (mac[i] < 16) {
+              macAddr += "0";
+          }
+          macAddr += String(mac[i], HEX);
+          if (i < 5) {
+              macAddr += ":";
+          }
+      }
+      return macAddr;
+  }
+
+  void post(float temperatura, float pressao, float umidade, float luzUV, float luzNormal, float luzInfravermelha, float velocidadeVento, float nivelPrecipitacao) {
+    if (client.connect(serverIP, serverPort)) {
+      client.println("GET /api/NimbusBox/postNimbusProduct?nrTemperatura=" + 
+                      String(temperatura) + "&nrPressao=" + 
+                      String(pressao) + "&nrUmidade=" + 
+                      String(umidade) + "&nrLuzUv=" + 
+                      String(luzUV) + "&nrEspectroLuz=" + 
+                      String(luzNormal) + "&nrInfraVermelho=" + 
+                      String(luzInfravermelha) + "&nrVelVento=" + 
+                      String(velocidadeVento) + "&nrAguaAltura=" + 
+                      String(nivelPrecipitacao) + "&macAddress=" +
+                      String(macAddress) + 
+                      "&idUserNimbus=4" + " HTTP/1.1");
+      client.println("Host: " + String(serverIP));  
+      client.println("Content-Type: application/x-www-form-urlencoded");
+      client.println();
+      
+      delay(500);
+
+      client.stop();
+      Serial.println("\nDados enviados com sucesso!");
+    } else {
+      Serial.println("Falha ao se conectar ao servidor");
+    }
+  }
+};
+
+Tsl2561 tsl2561;
+Bme280 bme280;
+Ml8511 ml8511;
+
+Anemometro ane;
+Pluviometro pluv;
+
+W5100 w5100;
+
+void setup(void) {
+  Serial.begin(9600);
+  tsl2561.start();
+  bme280.start();
+  pluv.start();
+  w5100.start();
+}
+
+void printValues() {
+  Serial.print("BME280: T:");
+  Serial.print(bme280.temp);
+  Serial.print(" P: ");
+  Serial.print(bme280.pres);
+  Serial.print(" U: ");
+  Serial.println(bme280.umid);
+  Serial.print("TSL2561: visible: ");
+  Serial.println(tsl2561.visible);
+  Serial.print("TSL2561: Infrared: ");
+  Serial.println(tsl2561.inf);
+  Serial.print("ML8511: ");
+  Serial.println(ml8511.uvInt);
+  Serial.print("Anemometer: ");
+  Serial.println(ane.WindSpeed);
+  Serial.print("Pluviometer: ");
+  Serial.println(pluv.mmTotal);
+  Serial.print("----------------------------------------------------");
+}
+
+void loop(void) {
+  tsl2561.getLux();
+  bme280.getData();
+  ml8511.getUV();
+  ane.getData();
+  pluv.getData();
+
+  printValues();
+
+  w5100.send(bme280.temp, bme280.pres, bme280.umid, ml8511.uvInt, tsl2561.visible, tsl2561.inf, ane.WindSpeed, pluv.mmTotal);
+}
